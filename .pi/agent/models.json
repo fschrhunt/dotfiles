@@ -1,0 +1,32 @@
+{
+  "providers": {
+    "opencode-go": {
+      "models": [
+        {
+          "id": "hy3-preview",
+          "name": "Hy3 Preview",
+          "api": "openai-completions",
+          "reasoning": true,
+          "input": ["text"],
+          "cost": { "input": 0.14, "output": 0.58, "cacheRead": 0.035, "cacheWrite": 0 },
+          "compat": {
+            "supportsStore": false,
+            "supportsDeveloperRole": false,
+            "maxTokensField": "max_tokens"
+          },
+          "contextWindow": 256000,
+          "maxTokens": 64000,
+          "thinkingLevelMap": {
+            "off": "none",
+            "minimal": null,
+            "low": "low",
+            "medium": null,
+            "high": "high",
+            "xhigh": null,
+            "max": null
+          }
+        }
+      ]
+    }
+  }
+}

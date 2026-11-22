@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# worktree: a PreToolUse hook for Bash, shared by Claude Code and Codex (both link here).
+# Agent branch names (codex/*, pi/* and opencode/* from ~/.local/bin/worktree, ask/*, claude/*
+# from Claude Code's WorktreeCreate hook, and older worktree-* branches) are local placeholders,
+# so this blocks a `git push` from one: exit 2 with the reason on stderr. The push's directory is
+# `git -C DIR`, else a leading `cd DIR &&`, else the hook's cwd. Anything else, or any failure,
+# exits 0 and lets the call through. OpenCode (~/.config/opencode/plugins/worktree) and Pi
+# (~/.pi/agent/extensions/worktree) run the same check in their own plugins; keep the prefixes in sync.
+input=$(cat)
+[[ $input == *push* ]] || exit 0
+command=$(jq -r '.tool_input.command // empty' <<<"$input" 2>/dev/null) || exit 0
+cwd=$(jq -r '.cwd // empty' <<<"$input" 2>/dev/null) || exit 0
+push='(^|[;&|[:space:](])git[[:space:]]+(-C[[:space:]]+([^[:space:];&|]+)[[:space:]]+)?push([[:space:]]|$)'
+cd='^[[:space:]]*cd[[:space:]]+([^[:space:];&|]+)[[:space:]]*(&&|;)'
+[[ $command =~ $push ]] || exit 0
+dir=${BASH_REMATCH[3]}
+[[ -z $dir && $command =~ $cd ]] && dir=${BASH_REMATCH[1]}
+dir=${dir//[\"\']/}
+case $dir in
+  '') dir=${cwd:-.} ;;
+  '~'*) dir=$HOME${dir:1} ;;
+  /*) ;;
+  *) dir=${cwd:-.}/$dir ;;
+esac
+branch=$(git -C "$dir" branch --show-current 2>/dev/null) || exit 0
+case $branch in
+  codex/* | pi/* | opencode/* | ask/* | claude/* | worktree-*)
+    echo "Blocked: '$branch' is a local agent branch name. Before the first push, rename it to say what its commits do, without the agent prefix (git branch -m <name>), then push again." >&2
+    exit 2 ;;
+esac
+exit 0

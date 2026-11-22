@@ -1,0 +1,10 @@
+[user]
+	email = 264049687+fschrhunt@users.noreply.github.com
+	name = fschrhunt
+[core]
+	hooksPath = ~/.config/git/hooks
+[init]
+	defaultBranch = main
+# Per-device settings, such as the credential helper; not in the dotfiles repo.
+[include]
+	path = ~/.gitconfig.local

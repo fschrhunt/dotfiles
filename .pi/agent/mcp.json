@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tap": {
+      "command": "tap",
+      "exposure": "direct"
+    }
+  }
+}

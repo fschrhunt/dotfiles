@@ -1,0 +1,5 @@
+{
+  "jobs": 8,
+  "worktrees": ".ask/worktrees/{name}",
+  "worktree": true
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "agents": {
+    "title": { "model": "opencode-go/qwen3.8-flash" }
+  },
+  "permissions": [
+    { "action": "*", "resource": "*", "effect": "allow" },
+    { "action": "subagent", "resource": "*", "effect": "deny" },
+    { "action": "websearch", "resource": "*", "effect": "deny" },
+    { "action": "read", "resource": "*.env", "effect": "ask" },
+    { "action": "read", "resource": "*.env.*", "effect": "ask" }
+  ],
+  "mcp": {
+    "servers": {
+      "tap": {
+        "type": "local",
+        "command": ["tap"]
+      }
+    }
+  }
+}

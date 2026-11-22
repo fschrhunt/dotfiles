@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Daily update of this machine's tools, run by update.timer on fat and the update launch agent
+# on the Macs: these dotfiles (a fast-forward pull of ~/.dotfiles, then the shared agent settings;
+# a file edited by hand stops the pull instead of being overwritten), Homebrew and, where there is one, its Brewfile (including the
+# claude-code@latest and codex casks), the agent CLIs that update themselves, the Rust toolchain,
+# and the project clones in ~/dev that are clean and on their default branch.
+#
+#   update    run every step; one that fails is reported and the rest still run
+#
+# Exits 1 when a step failed, so `systemctl --user status update` shows it.
+set -uo pipefail
+# Same PATH as a login shell: fat's shared path.sh, or Homebrew and ~/.local/bin on a Mac.
+if [ -r "$HOME/.config/shell/path.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HOME/.config/shell/path.sh"
+else
+  export PATH="$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/opt/homebrew/opt/rustup/bin:$PATH"
+fi
+# Project clones.
+root=$HOME/dev
+# Tailscale's system daemon runs from Homebrew and owns its keg's bin folder as root, so brew
+# can't delete old Tailscale kegs without sudo; leave them out rather than fail every run.
+export HOMEBREW_NO_CLEANUP_FORMULAE=tailscale
+
+failed=()
+
+# step NAME COMMAND...: run one step, noting it when it fails.
+step() {
+  local name=$1
+  shift
+  echo "== $name"
+  "$@" || { echo "!! $name failed"; failed+=("$name"); }
+}
+
+# Fast-forward each clone in $root (~/dev/<repo>) that is clean and on its default branch; leave
+# the rest alone.
+refresh_repos() {
+  local repo ref default
+  for repo in "$root"/*/; do
+    git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || continue
+    git -C "$repo" fetch --prune --quiet origin || { echo "fetch failed: $repo"; continue; }
+    ref=$(git -C "$repo" symbolic-ref --quiet refs/remotes/origin/HEAD) || continue
+    default=${ref#refs/remotes/origin/}
+    if [ "$(git -C "$repo" branch --show-current)" = "$default" ] && [ -z "$(git -C "$repo" status --porcelain)" ]; then
+      git -C "$repo" merge --ff-only --quiet "origin/$default" 2>/dev/null || echo "not fast-forwardable: $repo"
+    fi
+  done
+}
+
+# Steps for tools a machine does not have are skipped, not reported as failures.
+has() { command -v "$1" >/dev/null; }
+
+step dotfiles git --git-dir="$HOME/.dotfiles" --work-tree="$HOME" pull --ff-only --quiet
+step agent-settings python3 "$HOME/.local/share/agent-settings/apply.py"
+step brew brew update --quiet
+[ -f "$HOME/.config/homebrew/Brewfile" ] && step brewfile brew bundle --file "$HOME/.config/homebrew/Brewfile" --quiet
+step brew-upgrade brew upgrade --formula
+step brew-casks brew upgrade --cask
+step codex brew upgrade --cask codex
+has rustup && step rustup rustup update
+step claude brew upgrade --cask claude-code@latest
+has pi && step pi pi update
+[ -x "$HOME/.local/bin/fx" ] && step fx "$HOME/.local/bin/fx" upgrade
+step repos refresh_repos
+
+echo "update finished $(date -u +%FT%TZ)${failed[*]:+; failed: ${failed[*]}}"
+[ ${#failed[@]} -eq 0 ]

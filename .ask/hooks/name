@@ -1,0 +1,9 @@
+#!/bin/sh
+# ~/.ask/hooks/name: give worktree runs a made-up name like bright-running-fox from
+# `worktree generator`, so ask's worktrees and branches (ask/<name>) look like every other agent's.
+# Other runs keep ask's own name from the prompt. An ask without the event's `worktree` field
+# names every run this way. ask adds a number if the name is taken; any failure keeps ask's name.
+[ "$1" = events ] && { echo name; exit 0; }
+jq -e '.worktree != false' >/dev/null 2>&1 || exit 0
+name=$("$HOME/.local/bin/worktree" generator) || exit 0
+jq -cn --arg name "$name" '{name: $name}'

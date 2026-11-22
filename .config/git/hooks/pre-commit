@@ -1,0 +1,29 @@
+#!/bin/sh
+# Global pre-commit hook (core.hooksPath): commits must be made as one of my own GitHub
+# identities, so GitHub (and deploys such as Vercel that need a mapped author) can attribute them.
+#
+# Only the committer is checked; it is whatever git config or GIT_COMMITTER_EMAIL says I am. The
+# author is left alone so commits authored by bots and agents (Claude, Cursor, ...) pass through.
+# A repo's own .git/hooks/pre-commit still runs afterwards.
+
+allowed="264049687+fschrhunt@users.noreply.github.com fschrhunt@gmail.com"
+
+email=$(git var GIT_COMMITTER_IDENT 2>/dev/null | sed -n 's/.*<\(.*\)>.*/\1/p')
+case " $allowed " in
+  *" $email "*) ;;
+  *)
+    echo "pre-commit: refusing to commit as '$email'." >&2
+    echo "  Commit as one of: $allowed" >&2
+    echo "    git config --global user.email 264049687+fschrhunt@users.noreply.github.com" >&2
+    exit 1
+    ;;
+esac
+
+# core.hooksPath shadows .git/hooks, so hand off to a repo-local pre-commit hook if there is one.
+# Husky repos set their own core.hooksPath and never reach here.
+local_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/pre-commit"
+if [ -x "$local_hook" ]; then
+  exec "$local_hook" "$@"
+fi
+
+exit 0

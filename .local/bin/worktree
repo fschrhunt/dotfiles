@@ -1,0 +1,1242 @@
+#!/usr/bin/env bash
+# worktree AGENT [-w [name]] [--base REF] [--no-fetch] [args...]: run AGENT; with -w before --,
+# run it in <repo>/.<agent>/worktrees/<name> on branch <agent>/<name>, based on the latest
+# <remote>/<primary> (or --base REF). The same name reopens the worktree, not the agent session;
+# use the agent's own resume flags for that. Without a name, generator makes one up. ~/.zshrc
+# routes codex, opencode and pi here. The <agent>/ prefix marks the branch as local agent work;
+# each agent's `worktree` hook asks agents to rename it before their first push.
+#
+# worktree generator: print a made-up name; ~/.ask/hooks/name names ask's runs with it.
+# worktree --prepare PROGRAM [args...]: select the directory and write it and remaining
+# arguments as NUL-terminated fields for rmt, without starting the program.
+# worktree sync [--all] [--root DIR] [--no-fetch]: put each project's main checkout on its primary
+# branch and fast-forward it. `sync` alone does the repository holding the current directory.
+# worktree clean [--all] [--tasks] [--here] [--root DIR] [--no-fetch] [--superseded] [--contained] [--yes|-y]:
+# remove clean worktrees whose work landed in the primary branch, plus (with --all/--tasks) task
+# clones under ROOT (default ~/dev). No flags clean the current repository, or everything under
+# ROOT outside one; --all always means everything. --superseded also includes work likely landed
+# after a rework; --contained also includes worktrees whose commits another branch still holds.
+# Without --yes it only prints the plan.
+# worktree trust [--all] [--quiet] [--root DIR] [DIR...]: record workspace trust for DIR's repo
+# root (or ROOT and every repository under it with --all) in Claude Code, Codex and Pi. Claude and
+# Codex key trust on the repository root; Pi walks up to a parent. Worktrees use the main root.
+# OpenCode has no workspace trust store: its permissions already control what it may do.
+#
+# The main checkout (~/dev/<project>) is a reference copy: it stays on the primary branch and is
+# never a work target. `-w` refuses to start when it is on another branch unless --base makes the
+# starting point explicit. Launching an agent in the main checkout without -w is refused; pass
+# --here to do it deliberately (a read-only look, or to recover from a checkout you changed).
+# A script, not a shell function, so agents' shells (which drop _-prefixed functions) can run it.
+set -euo pipefail
+
+# Print a diagnostic that never gets mixed into --prepare's NUL stream.
+note() { printf 'worktree: %s\n' "$*" >&2; }
+
+# expand_path PATH: expand a leading ~ so --root and WORKTREE_ROOT take either form.
+expand_path() {
+  local path=$1
+  # shellcheck disable=SC2088 # ~ in a case pattern is literal, not an expansion.
+  case $path in
+    '~') path=$HOME ;;
+    '~/'*) path=$HOME/${path:2} ;;
+  esac
+  printf '%s\n' "$path"
+}
+
+# managed_root: the directory holding projects and task clones.
+managed_root() { expand_path "${WORKTREE_ROOT:-$HOME/dev}"; }
+
+# Cleanup counters and their printed lines, so one run ends with a summary.
+CLEAN_REMOVED=0
+CLEAN_WOULD=0
+CLEAN_KEPT=0
+CLEAN_FAILED=0
+clean_keep() { CLEAN_KEPT=$((CLEAN_KEPT + 1)); echo "keep    $*"; }
+clean_would() { CLEAN_WOULD=$((CLEAN_WOULD + 1)); echo "would remove $*"; }
+clean_removed() { CLEAN_REMOVED=$((CLEAN_REMOVED + 1)); echo "removed $*"; }
+clean_failed() { CLEAN_FAILED=$((CLEAN_FAILED + 1)); note "could not remove $*"; }
+
+# generator: print a made-up adjective-verb-noun name like bright-running-fox, the way Claude Code
+# names an unnamed worktree, so every agent's unnamed worktree looks alike.
+generator() {
+  local adjectives=(bright calm clever cosmic crisp curious daring eager gentle golden happy
+    hidden humble jolly keen lively lucky mellow merry nimble quiet rapid shiny silent snowy
+    sunny swift tidy vivid warm wild witty)
+  local verbs=(baking bouncing building chasing climbing dancing drifting dreaming flying
+    gliding glowing hiking humming jumping leaping painting racing roaming rolling running
+    sailing singing skating soaring spinning sprinting swimming tumbling wandering whistling)
+  local nouns=(badger beacon breeze brook canyon cloud comet coral falcon fern forest fox
+    glacier harbor heron island lantern maple meadow otter owl panda pebble pine raven river
+    rocket sparrow star tiger walrus willow)
+  echo "${adjectives[RANDOM % ${#adjectives[@]}]}-${verbs[RANDOM % ${#verbs[@]}]}-${nouns[RANDOM % ${#nouns[@]}]}"
+}
+
+# main_checkout DIR: the repository's main checkout (the worktree holding its .git), even when DIR
+# is inside a linked worktree.
+main_checkout() {
+  local dir=$1 first
+  IFS= read -r -d '' first < <(git -C "$dir" worktree list --porcelain -z 2>/dev/null) ||
+    return 1
+  [[ $first == 'worktree '* ]] || return 1
+  first=${first#worktree }
+  printf '%s\n' "$first"
+}
+
+# primary_branch TOP: the branch new work starts from, preferring the remote's default branch and
+# falling back to main, master, then the main checkout's current branch.
+primary_branch() {
+  local top=$1 ref b
+  ref=$(git -C "$top" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || ref=
+  if [[ $ref == origin/* ]]; then
+    printf '%s\n' "${ref#origin/}"
+    return 0
+  fi
+  for b in main master; do
+    if git -C "$top" show-ref -q --verify "refs/heads/$b"; then
+      printf '%s\n' "$b"
+      return 0
+    fi
+  done
+  git -C "$top" branch --show-current 2>/dev/null
+}
+
+# primary_remote TOP: origin when it exists, else the first remote, else "".
+primary_remote() {
+  local top=$1 remote
+  if git -C "$top" remote get-url origin >/dev/null 2>&1; then
+    printf 'origin\n'
+    return 0
+  fi
+  remote=$(git -C "$top" remote 2>/dev/null | head -n 1)
+  if [[ -n $remote ]]; then
+    printf '%s\n' "$remote"
+  fi
+}
+
+# fetch_primary TOP REMOTE: update remote-tracking refs without letting a prompt hang an agent.
+fetch_primary() {
+  local top=$1 remote=$2
+  [[ -n $remote ]] || return 0
+  GIT_TERMINAL_PROMPT=0 git -C "$top" fetch --prune --quiet "$remote"
+}
+
+# base_commit TOP REMOTE PRIMARY: the commit new work should start from. The remote's primary
+# branch wins, so a stale or unrelated checkout does not leak into a new worktree.
+base_commit() {
+  local top=$1 remote=$2 primary=$3 ref
+  if [[ -n $remote ]] &&
+    git -C "$top" show-ref -q --verify "refs/remotes/$remote/$primary"; then
+    ref=$remote/$primary
+  elif git -C "$top" show-ref -q --verify "refs/heads/$primary"; then
+    ref=$primary
+  else
+    ref=HEAD
+  fi
+  git -C "$top" rev-parse --verify "$ref^{commit}"
+}
+
+# landed DIR BRANCH TARGET: whether BRANCH's changes are already in TARGET, including a squash
+# merge. A strict merge is an ancestor; otherwise every file the branch changed must match TARGET.
+landed() {
+  local dir=$1 branch=$2 target=$3 base f cherry ahead bpid c cpid
+  local -a files=()
+  git -C "$dir" show-ref -q --verify "refs/heads/$branch" || return 1
+  git -C "$dir" rev-parse --verify --quiet "$target^{commit}" >/dev/null || return 1
+  if git -C "$dir" merge-base --is-ancestor "$branch" "$target" 2>/dev/null; then
+    return 0
+  fi
+  base=$(git -C "$dir" merge-base "$target" "$branch" 2>/dev/null) || return 1
+  [[ $base == $(git -C "$dir" rev-parse "$branch") ]] && return 0
+  # A deleted remote branch is usually a merged pull request: every commit's patch is already
+  # upstream even when later commits changed the same files. `git cherry` marks those with "-".
+  cherry=$(git -C "$dir" cherry "$target" "$branch" 2>/dev/null) || return 1
+  if [[ -n $cherry ]] && ! grep -q '^+' <<<"$cherry"; then
+    return 0
+  fi
+  # A multi-commit branch can be squash-merged as one commit. Its combined patch-id is stable
+  # across later edits to the same files, so compare it with each commit added to TARGET.
+  ahead=$(git -C "$dir" rev-list --count "$base..$branch" 2>/dev/null) || ahead=0
+  if ((ahead > 1)); then
+    bpid=$(git -C "$dir" diff "$base" "$branch" 2>/dev/null |
+      git patch-id --stable 2>/dev/null | awk 'NR == 1 { print $1 }')
+    if [[ -n $bpid ]]; then
+      for c in $(git -C "$dir" rev-list "$base..$target" 2>/dev/null); do
+        git -C "$dir" rev-parse --verify --quiet "$c^" >/dev/null || continue
+        cpid=$(git -C "$dir" diff "$c^" "$c" 2>/dev/null |
+          git patch-id --stable 2>/dev/null | awk 'NR == 1 { print $1 }')
+        [[ -n $cpid && $cpid == "$bpid" ]] && return 0
+      done
+    fi
+  fi
+  while IFS= read -r -d '' f; do files+=("$f"); done < <(
+    git -C "$dir" diff --name-only -z "$base" "$branch"
+  )
+  ((${#files[@]} == 0)) && return 0
+  git -C "$dir" diff --quiet "$target" "$branch" -- "${files[@]}" 2>/dev/null
+}
+
+# likely_landed DIR BRANCH TARGET: advisory check for work reworked into TARGET. Every file the
+# branch changed must have the branch's final blob somewhere in TARGET's history at that path, or
+# be deleted from TARGET. Renames and partial rewrites stay "not landed".
+likely_landed() {
+  local dir=$1 branch=$2 target=$3 base file blob commit found ok=yes
+  git -C "$dir" show-ref -q --verify "refs/heads/$branch" || return 1
+  base=$(git -C "$dir" merge-base "$target" "$branch" 2>/dev/null) || return 1
+  while IFS= read -r -d '' file; do
+    if git -C "$dir" cat-file -e "$branch:$file" 2>/dev/null; then
+      blob=$(git -C "$dir" rev-parse "$branch:$file" 2>/dev/null) || { ok=no; break; }
+      if git -C "$dir" cat-file -e "$target:$file" 2>/dev/null &&
+        [[ $(git -C "$dir" rev-parse "$target:$file" 2>/dev/null) == "$blob" ]]; then
+        continue
+      fi
+      found=no
+      while IFS= read -r commit; do
+        [[ -n $commit ]] || continue
+        if git -C "$dir" cat-file -e "$commit:$file" 2>/dev/null &&
+          [[ $(git -C "$dir" rev-parse "$commit:$file" 2>/dev/null) == "$blob" ]]; then
+          found=yes
+          break
+        fi
+      done < <(git -C "$dir" rev-list "$base..$target" -- "$file" 2>/dev/null)
+      [[ $found == yes ]] || { ok=no; break; }
+    else
+      # The branch deleted the file; TARGET must not have it.
+      if git -C "$dir" cat-file -e "$target:$file" 2>/dev/null; then ok=no; break; fi
+    fi
+  done < <(git -C "$dir" diff --name-only -z "$base" "$branch" 2>/dev/null)
+  [[ $ok == yes ]]
+}
+
+# contained_in DIR BRANCH: print the first local or remote branch that contains BRANCH, other than
+# BRANCH itself and its own upstream. Empty when no other ref holds its commits.
+contained_in() {
+  local dir=$1 branch=$2 upstream='' ref
+  upstream=$(git -C "$dir" rev-parse --abbrev-ref "$branch@{upstream}" 2>/dev/null) || upstream=
+  while IFS= read -r ref; do
+    [[ -n $ref ]] || continue
+    [[ $ref == "$branch" || $ref == "$upstream" ]] && continue
+    [[ $ref == */"$branch" ]] && continue
+    printf '%s\n' "$ref"
+    return 0
+  done < <(git -C "$dir" for-each-ref --contains "$branch" --format='%(refname:short)' refs/heads refs/remotes 2>/dev/null)
+  return 1
+}
+
+# ask_active: succeed while any ask run holds its lock. Ask keeps a kernel record lock on
+# ~/.ask/runs/*/lock, so trying to lock it from here detects a live run without guessing PIDs.
+ASK_RUNNING=unknown
+ask_active() {
+  if [[ $ASK_RUNNING == unknown ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      if python3 - <<'PY'
+import fcntl, glob, os, sys
+for path in glob.glob(os.path.join(os.path.expanduser("~"), ".ask", "runs", "*", "lock")):
+    try:
+        f = open(path, "r+")
+    except OSError:
+        continue
+    try:
+        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)
+    finally:
+        f.close()
+sys.exit(1)
+PY
+      then
+        ASK_RUNNING=yes
+      else
+        ASK_RUNNING=no
+      fi
+    elif command -v lsof >/dev/null 2>&1; then
+      if find "$HOME/.ask/runs" -mindepth 2 -maxdepth 2 -name lock \
+        -exec lsof -t {} + 2>/dev/null | grep -q .; then
+        ASK_RUNNING=yes
+      else
+        ASK_RUNNING=no
+      fi
+    else
+      # Cannot check; keeping ask worktrees is safer than deleting a live one.
+      ASK_RUNNING=yes
+    fi
+  fi
+  [[ $ASK_RUNNING == yes ]]
+}
+
+# worktree_locked TOP PATH: whether PATH is registered and locked in TOP's worktree list.
+worktree_locked() {
+  local top=$1 path=$2 line p='' locked=no
+  while IFS= read -r line; do
+    case $line in
+      'worktree '*) p=${line#worktree }; locked=no ;;
+      'locked'*) locked=yes ;;
+      '')
+        if [[ $p == "$path" && $locked == yes ]]; then return 0; fi
+        p=
+        locked=no
+        ;;
+    esac
+  done < <(git -C "$top" worktree list --porcelain; printf '\n')
+  return 1
+}
+
+# prune_agent_dirs TOP: remove empty per-agent worktree parents after their last worktree.
+prune_agent_dirs() {
+  local top=$1 agent
+  for agent in claude codex opencode pi ask; do
+    if [[ -d $top/.$agent/worktrees ]] && rmdir "$top/.$agent/worktrees" 2>/dev/null; then
+      echo "removed empty $top/.$agent/worktrees"
+    fi
+  done
+}
+
+# clean_repo TOP YES FETCH PROTECT: remove every clean linked worktree whose branch has landed in
+# TOP's primary branch. YES=no only prints the plan. The main checkout, PROTECT (the invoking
+# worktree), and locked worktrees stay.
+clean_repo() {
+  local top=$1 yes=$2 fetch=$3 protect=${4:-} superseded=${5:-no} contained=${6:-no} remote primary target current line path branch locked block_locked dirty modified untracked reason container delete_branch
+  local -a paths=() branches=()
+  top=$(main_checkout "$top" 2>/dev/null) || top=
+  [[ -n $top ]] || { note "clean: not a git repository"; return 0; }
+  remote=$(primary_remote "$top") || true
+  if [[ $fetch == yes && -n $remote ]]; then
+    fetch_primary "$top" "$remote" || note "$top: could not fetch $remote; using cached refs"
+  fi
+  primary=$(primary_branch "$top") || true
+  if [[ -z $primary ]]; then
+    note "$top: no primary branch to compare; skipping"
+    return 0
+  fi
+  if [[ -n $remote ]] &&
+    git -C "$top" show-ref -q --verify "refs/remotes/$remote/$primary"; then
+    target=$remote/$primary
+  else
+    target=$primary
+  fi
+  git -C "$top" rev-parse --verify --quiet "$target^{commit}" >/dev/null ||
+    { note "$top: no $target; skipping"; return 0; }
+  current=$(git -C "$top" rev-parse --path-format=absolute --show-toplevel 2>/dev/null) || current=
+  locked=no
+
+  while IFS= read -r line; do
+    case $line in
+      'worktree '*) paths+=("${line#worktree }") ;;
+      'branch refs/heads/'*) branches+=("${line#branch refs/heads/}") ;;
+      'locked'*) locked=yes ;;
+    esac
+    [[ -n $line ]] && continue
+
+    path=
+    branch=
+    block_locked=$locked
+    locked=no
+    ((${#paths[@]})) && path=${paths[$((${#paths[@]} - 1))]}
+    ((${#branches[@]})) && branch=${branches[$((${#branches[@]} - 1))]}
+    paths=()
+    branches=()
+    [[ -n $path && $path != "$top" && $path != "$current" && $path != "$protect" ]] || continue
+
+    if [[ ! -d $path ]]; then
+      if [[ $yes == yes ]]; then
+        git -C "$top" worktree prune
+      else
+        echo "would prune missing $path"
+      fi
+      continue
+    fi
+    if [[ $block_locked == yes ]]; then
+      clean_keep "$path${branch:+ ($branch)} · in use (locked)"
+      continue
+    fi
+    if git -C "$top" worktree list --porcelain | grep -Fq "worktree $path/"; then
+      clean_keep "$path · contains a nested worktree"
+      continue
+    fi
+    case $path in
+      */.ask/worktrees/*)
+        if ask_active; then
+          clean_keep "$path · ask run active"
+          continue
+        fi
+        ;;
+    esac
+    dirty=$(git -C "$path" status --porcelain 2>/dev/null)
+    if [[ -n $dirty ]]; then
+      untracked=$(printf '%s\n' "$dirty" | grep -c '^??' || true)
+      modified=$(printf '%s\n' "$dirty" | grep -vc '^??' || true)
+      clean_keep "$path${branch:+ ($branch)} · uncommitted: ${modified} tracked, ${untracked} untracked"
+      continue
+    fi
+    if [[ -z $branch ]]; then
+      clean_keep "$path · detached HEAD"
+      continue
+    fi
+    delete_branch=yes
+    if landed "$top" "$branch" "$target"; then
+      reason="landed in $target"
+    elif container=$(contained_in "$top" "$branch"); then
+      if [[ $contained != yes ]]; then
+        clean_keep "$path ($branch) · contained in $container; use --contained"
+        continue
+      fi
+      reason="contained in $container"
+      delete_branch=no
+    elif likely_landed "$top" "$branch" "$target"; then
+      if [[ $superseded != yes ]]; then
+        clean_keep "$path ($branch) · likely landed (reworked); use --superseded"
+        continue
+      fi
+      reason="likely landed in $target (reworked)"
+    else
+      clean_keep "$path ($branch) · not landed in $target"
+      continue
+    fi
+    if [[ $yes != yes ]]; then
+      if [[ $delete_branch == yes ]]; then
+        clean_would "$path ($branch) · $reason"
+      else
+        clean_would "$path · $reason (branch $branch kept)"
+      fi
+      continue
+    fi
+    case $path in
+      */.ask/worktrees/*)
+        ASK_RUNNING=unknown
+        if ask_active; then
+          clean_keep "$path · ask run active"
+          continue
+        fi
+        ;;
+    esac
+    if git -C "$top" worktree remove "$path" 2>/dev/null; then
+      if [[ $delete_branch == yes ]]; then
+        git -C "$top" branch -D "$branch" >/dev/null 2>&1 || true
+        clean_removed "$path ($branch) · $reason"
+      else
+        clean_removed "$path · $reason (branch $branch kept)"
+      fi
+    else
+      clean_failed "$path ($branch)"
+    fi
+  done < <(git -C "$top" worktree list --porcelain; printf '\n')
+  if [[ $yes == yes ]]; then
+    git -C "$top" worktree prune
+    prune_agent_dirs "$top"
+  fi
+}
+
+# clean_task_clones YES FETCH ROOT: remove clean, landed independent clones under ROOT/.* and the
+# task folders they leave empty. Linked worktrees belong to their repository and are handled by
+# clean_repo; a clone that still has linked worktrees is left alone so it cannot orphan them.
+clean_task_clones() {
+  local yes=$1 fetch=$2 root=$3 superseded=${4:-no} contained=${5:-no} dir repo count remote primary target head branch dirty modified untracked b blocked blocked_note container here='' gitdir='' commondir=''
+  local -a local_branches=()
+  here=$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null) || here=
+  shopt -s nullglob
+  for dir in "$root"/.[!.]*; do
+    [[ -d $dir && $dir != "$root/.git" ]] || continue
+    for repo in "$dir"/*/; do
+      repo=${repo%/}
+      [[ -L $repo ]] && { clean_keep "$repo · symlink"; continue; }
+      [[ -e $repo/.git ]] || continue
+      gitdir=$(git -C "$repo" rev-parse --path-format=absolute --git-dir 2>/dev/null) || gitdir=
+      commondir=$(git -C "$repo" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || commondir=
+      if [[ $gitdir != "$commondir" ]]; then
+        continue
+      fi
+      count=$(git -C "$repo" worktree list 2>/dev/null | wc -l | tr -d ' ')
+      if [[ ${count:-0} -gt 1 ]]; then
+        clean_repo "$repo" "$yes" "$fetch" "$here" "$superseded" "$contained"
+        count=$(git -C "$repo" worktree list 2>/dev/null | wc -l | tr -d ' ')
+        if [[ ${count:-0} -gt 1 ]]; then
+          clean_keep "$repo · linked worktrees remain"
+          continue
+        fi
+      fi
+      if [[ -n $here && ($here == "$repo" || $here == "$repo"/*) ]]; then
+        clean_keep "$repo · current directory"
+        continue
+      fi
+      if [[ -n $(git -C "$repo" stash list 2>/dev/null) ]]; then
+        clean_keep "$repo · has stashes"
+        continue
+      fi
+      remote=$(primary_remote "$repo") || true
+      if [[ $fetch == yes && -n $remote ]]; then
+        fetch_primary "$repo" "$remote" || note "$repo: could not fetch $remote; using cached refs"
+      fi
+      primary=$(primary_branch "$repo") || true
+      if [[ -z $primary ]]; then
+        clean_keep "$repo · no primary branch"
+        continue
+      fi
+      if [[ -n $remote ]] &&
+        git -C "$repo" show-ref -q --verify "refs/remotes/$remote/$primary"; then
+        target=$remote/$primary
+      else
+        target=$primary
+      fi
+      dirty=$(git -C "$repo" status --porcelain 2>/dev/null) || dirty=x
+      if [[ -n $dirty ]]; then
+        if [[ $dirty == x ]]; then
+          clean_keep "$repo · cannot read status"
+        else
+          untracked=$(printf '%s\n' "$dirty" | grep -c '^??' || true)
+          modified=$(printf '%s\n' "$dirty" | grep -vc '^??' || true)
+          clean_keep "$repo · uncommitted: ${modified} tracked, ${untracked} untracked"
+        fi
+        continue
+      fi
+      branch=$(git -C "$repo" branch --show-current 2>/dev/null) || branch=
+      if [[ -z $branch ]]; then
+        clean_keep "$repo · detached HEAD"
+        continue
+      fi
+      local_branches=()
+      while IFS= read -r head; do local_branches+=("$head"); done < <(
+        git -C "$repo" for-each-ref --format='%(refname:short)' refs/heads
+      )
+      if ((${#local_branches[@]} == 0)); then
+        clean_keep "$repo · no local branches"
+        continue
+      fi
+      blocked=
+      blocked_note=
+      for b in "${local_branches[@]}"; do
+        [[ $b == "$primary" ]] && continue
+        if landed "$repo" "$b" "$target"; then continue; fi
+        if container=$(contained_in "$repo" "$b"); then
+          blocked=$b
+          blocked_note="contained in $container; remove it as a worktree if safe"
+          break
+        fi
+        if likely_landed "$repo" "$b" "$target"; then
+          if [[ $superseded == yes ]]; then continue; fi
+          blocked=$b
+          blocked_note="likely landed (reworked); use --superseded"
+          break
+        fi
+        blocked=$b
+        blocked_note="not landed in $target"
+        break
+      done
+      if [[ -n $blocked ]]; then
+        clean_keep "$repo · $blocked $blocked_note"
+        continue
+      fi
+      if [[ $yes != yes ]]; then
+        if [[ $superseded == yes || $contained == yes ]]; then
+          clean_would "$repo · local branches landed or held elsewhere"
+        else
+          clean_would "$repo · local branches landed in $target"
+        fi
+      elif rm -rf "$repo"; then
+        if [[ $superseded == yes || $contained == yes ]]; then
+          clean_removed "$repo · local branches landed or held elsewhere"
+        else
+          clean_removed "$repo · local branches landed in $target"
+        fi
+      else
+        clean_failed "$repo"
+      fi
+    done
+  done
+  if [[ $yes == yes ]]; then
+    for dir in "$root"/.[!.]*; do
+      if [[ -d $dir && $dir != "$root/.git" ]] && rmdir "$dir" 2>/dev/null; then
+        echo "removed empty $dir"
+      fi
+    done
+  fi
+}
+
+# sync_repo TOP FETCH: switch TOP's main checkout to its primary branch when that is safe, then
+# fast-forward it from the remote. Uncommitted changes or local commits are reported, never reset.
+sync_repo() {
+  local top=$1 fetch=$2 remote primary current target ahead behind
+  top=$(main_checkout "$top" 2>/dev/null) || top=
+  [[ -n $top ]] || { note "sync: not a git repository"; return 0; }
+  remote=$(primary_remote "$top") || true
+  if [[ $fetch == yes && -n $remote ]]; then
+    fetch_primary "$top" "$remote" || note "$top: could not fetch $remote; using cached refs"
+  fi
+  primary=$(primary_branch "$top") || true
+  if [[ -z $primary ]]; then
+    note "$top: no primary branch"
+    return 0
+  fi
+  current=$(git -C "$top" branch --show-current 2>/dev/null) || current=
+  if [[ $current != "$primary" ]]; then
+    if [[ -n $(git -C "$top" status --porcelain 2>/dev/null) ]]; then
+      note "$top: on '${current:-detached HEAD}' with uncommitted changes; not switching to $primary"
+      return 0
+    fi
+    if git -C "$top" show-ref -q --verify "refs/heads/$primary"; then
+      if git -C "$top" switch -q "$primary" 2>/dev/null; then
+        note "$top: switched ${current:-detached HEAD} -> $primary"
+      else
+        note "$top: cannot switch to $primary"
+        return 0
+      fi
+    elif [[ -n $remote ]] &&
+      git -C "$top" show-ref -q --verify "refs/remotes/$remote/$primary"; then
+      if git -C "$top" switch -q -c "$primary" --track "$remote/$primary" 2>/dev/null; then
+        note "$top: created $primary from $remote/$primary"
+      else
+        note "$top: cannot create $primary from $remote/$primary"
+        return 0
+      fi
+    else
+      note "$top: no $primary branch"
+      return 0
+    fi
+  fi
+  if [[ -n $remote ]] &&
+    git -C "$top" show-ref -q --verify "refs/remotes/$remote/$primary"; then
+    target=$remote/$primary
+    if [[ -n $(git -C "$top" status --porcelain 2>/dev/null) ]]; then
+      note "$top: uncommitted changes; not fast-forwarding $primary"
+      return 0
+    fi
+    ahead=$(git -C "$top" rev-list --count "$target..$primary" 2>/dev/null) || ahead=0
+    behind=$(git -C "$top" rev-list --count "$primary..$target" 2>/dev/null) || behind=0
+    if ((ahead > 0 && behind > 0)); then
+      note "$top: $primary has $ahead local and is $behind behind $target; not fast-forwarding"
+    elif ((ahead > 0)); then
+      note "$top: $primary is $ahead commit(s) ahead of $target"
+    elif ((behind > 0)); then
+      if git -C "$top" merge -q --ff-only "$target" 2>/dev/null; then
+        note "$top: fast-forwarded $primary by $behind commit(s) to $target"
+      else
+        note "$top: cannot fast-forward $primary to $target"
+      fi
+    else
+      note "$top: $primary is up to date with $target"
+    fi
+  fi
+}
+
+# sync_main [--all] [--root DIR] [--no-fetch]: sync the current repository's main checkout, or
+# every project under ROOT with --all. The current repository is included with --all.
+sync_main() {
+  local all=no fetch=yes root='' root_given=no top='' ctop='' t dup=no
+  local -a tops=() seen=()
+  while (($#)); do
+    case $1 in
+      --all) all=yes; shift ;;
+      --root)
+        shift
+        [[ -n ${1:-} ]] || { note "sync: --root needs a directory"; return 2; }
+        root=$1
+        root_given=yes
+        shift
+        ;;
+      --no-fetch) fetch=no; shift ;;
+      --fetch) fetch=yes; shift ;;
+      -h | --help)
+        echo 'usage: worktree sync [--all] [--root DIR] [--no-fetch]'
+        return 0
+        ;;
+      *) note "sync: unknown argument $1"; return 2 ;;
+    esac
+  done
+  root=$(expand_path "${root:-$(managed_root)}")
+  if [[ -d $root ]]; then root=$(cd "$root" && pwd -P) || return 1; fi
+  [[ $root_given == yes ]] && all=yes
+  if [[ $fetch == no ]]; then
+    note "using cached refs; a remote update may not be visible"
+  fi
+  if [[ $all == yes ]]; then
+    [[ -d $root ]] || { note "sync: no directory $root"; return 1; }
+    while IFS= read -r -d '' top; do
+      tops+=("${top%/.git}")
+    done < <(find "$root" -mindepth 2 -maxdepth 2 -type d -name .git -print0 2>/dev/null)
+    [[ -e $root/.git ]] && tops+=("$root")
+    ctop=$(main_checkout "$PWD" 2>/dev/null) || ctop=
+    [[ -n $ctop ]] && tops+=("$ctop")
+    for top in ${tops[@]+"${tops[@]}"}; do
+      top=$(main_checkout "$top" 2>/dev/null) || top=
+      [[ -n $top ]] || continue
+      dup=no
+      for t in ${seen[@]+"${seen[@]}"}; do [[ $t == "$top" ]] && { dup=yes; break; }; done
+      [[ $dup == yes ]] && continue
+      seen+=("$top")
+      sync_repo "$top" "$fetch"
+    done
+    return 0
+  fi
+  top=$(main_checkout "$PWD") || { note "sync: not inside a git repository"; return 1; }
+  sync_repo "$top" "$fetch"
+}
+
+# clean_main [--all] [--tasks] [--here] [--root DIR] [--no-fetch] [--yes|-y]: show (or with --yes,
+# perform) cleanup. No flags cleans the current repository, or everything under ROOT outside one.
+# --all cleans every repository and task clone under ROOT, plus the current repository. --tasks
+# cleans task clones only. --here cleans the current repository only.
+clean_main() {
+  local all=no tasks=no here_only=no fetch=yes yes=no superseded=no contained=no root='' root_given=no here='' ctop='' top='' t dup=no
+  local -a tops=() seen=()
+  while (($#)); do
+    case $1 in
+      --all) all=yes; shift ;;
+      --tasks) tasks=yes; shift ;;
+      --here) here_only=yes; shift ;;
+      --root)
+        shift
+        [[ -n ${1:-} ]] || { note "clean: --root needs a directory"; return 2; }
+        root=$1
+        root_given=yes
+        shift
+        ;;
+      --no-fetch) fetch=no; shift ;;
+      --superseded) superseded=yes; shift ;;
+      --contained) contained=yes; shift ;;
+      --yes | -y) yes=yes; shift ;;
+      --dry-run) yes=no; shift ;;
+      -h | --help)
+        cat <<'EOF'
+usage: worktree clean [--all] [--tasks] [--here] [--root DIR] [--no-fetch] [--superseded] [--contained] [--yes|-y]
+
+No flags     clean the current repository, or everything under ROOT outside one
+--all        every repository and task clone under ROOT, plus the current repository
+--tasks      task clones under ROOT only
+--here       the current repository only
+--root       managed projects root (default $HOME/dev or WORKTREE_ROOT)
+--superseded also remove work that landed after a rework, not just exact merges
+--contained  also remove worktrees whose commits another branch still contains (branch kept)
+--yes, -y    remove; without it only the plan is printed
+
+A dry run reports a task clone as kept while it still has linked worktrees.
+EOF
+        return 0
+        ;;
+      *) note "clean: unknown argument $1"; return 2 ;;
+    esac
+  done
+  if [[ $here_only == yes ]] && [[ $all == yes || $tasks == yes ]]; then
+    note "clean: --here cannot be combined with --all or --tasks"
+    return 2
+  fi
+  root=$(expand_path "${root:-$(managed_root)}")
+  if [[ -d $root ]]; then root=$(cd "$root" && pwd -P) || return 1; fi
+  here=$(git rev-parse --path-format=absolute --show-toplevel 2>/dev/null) || here=
+  ctop=
+  [[ -n $here ]] && ctop=$(main_checkout "$here" 2>/dev/null) || true
+  if [[ $here_only == yes ]]; then
+    [[ -n $ctop ]] || { note "clean: not inside a git repository"; return 1; }
+    all=no
+    tasks=no
+  elif [[ $all == no && $tasks == no ]]; then
+    if [[ -n $ctop && $root_given == no ]]; then
+      all=no
+      tasks=no
+    else
+      all=yes
+      tasks=yes
+    fi
+  fi
+  if [[ $all == yes ]]; then tasks=yes; fi
+  if [[ $all == yes || $tasks == yes ]] && [[ ! -d $root ]]; then
+    note "clean: no directory $root"
+  fi
+
+  if [[ $fetch == no ]]; then
+    note "using cached refs; recently merged work may still look unlanded"
+  fi
+
+  CLEAN_REMOVED=0
+  CLEAN_WOULD=0
+  CLEAN_KEPT=0
+  CLEAN_FAILED=0
+  if [[ $all == no && $tasks == no ]]; then
+    clean_repo "$ctop" "$yes" "$fetch" "$here" "$superseded" "$contained"
+  else
+    if [[ $all == yes ]]; then
+      if [[ -d $root ]]; then
+        while IFS= read -r -d '' top; do
+          tops+=("${top%/.git}")
+        done < <(find "$root" -mindepth 2 -maxdepth 2 -type d -name .git -print0 2>/dev/null)
+        [[ -e $root/.git ]] && tops+=("$root")
+      fi
+      [[ -n $ctop ]] && tops+=("$ctop")
+      for top in ${tops[@]+"${tops[@]}"}; do
+        top=$(main_checkout "$top" 2>/dev/null) || top=
+        [[ -n $top ]] || continue
+        dup=no
+        for t in ${seen[@]+"${seen[@]}"}; do [[ $t == "$top" ]] && { dup=yes; break; }; done
+        [[ $dup == yes ]] && continue
+        seen+=("$top")
+        clean_repo "$top" "$yes" "$fetch" "$here" "$superseded" "$contained"
+      done
+    fi
+    if [[ $tasks == yes ]] && [[ -d $root ]]; then
+      clean_task_clones "$yes" "$fetch" "$root" "$superseded" "$contained"
+    fi
+  fi
+
+  if [[ $yes == yes ]]; then
+    printf 'worktree: %d removed, %d kept' "$CLEAN_REMOVED" "$CLEAN_KEPT"
+  else
+    printf 'worktree: %d would be removed, %d kept' "$CLEAN_WOULD" "$CLEAN_KEPT"
+  fi
+  if ((CLEAN_FAILED > 0)); then
+    printf ', %d failed\n' "$CLEAN_FAILED"
+    return 1
+  fi
+  if [[ $yes == yes ]]; then
+    printf '\n'
+  else
+    printf '; pass --yes to apply\n'
+  fi
+}
+
+# claude_config: the file Claude Code keeps project trust in.
+claude_config() { printf '%s/.claude.json\n' "$HOME"; }
+# codex_config: the file Codex keeps per-project trust in.
+codex_config() { printf '%s/.codex/config.toml\n' "$HOME"; }
+# pi_config: the file Pi keeps per-project trust in.
+pi_config() { printf '%s/.pi/agent/trust.json\n' "$HOME"; }
+
+# file_mode FILE DEFAULT: FILE's permission bits, or DEFAULT when it does not exist.
+file_mode() {
+  local file=$1 default=$2 mode
+  mode=$(stat -f '%Lp' "$file" 2>/dev/null) || mode=$(stat -c '%a' "$file" 2>/dev/null) || mode=
+  printf '%s\n' "${mode:-$default}"
+}
+
+# claude_trusted FILE ROOT: whether Claude records ROOT as trusted.
+claude_trusted() {
+  local file=$1 root=$2
+  [[ -f $file ]] || return 1
+  jq -e --arg root "$root" '.projects[$root].hasTrustDialogAccepted == true' "$file" >/dev/null 2>&1
+}
+
+# trust_claude_store QUIET ROOT...: mark each ROOT trusted in Claude's project map.
+trust_claude_store() {
+  local quiet=$1; shift
+  local file tmp roots_json root mode
+  local -a todo=()
+  file=$(claude_config)
+  for root in "$@"; do
+    claude_trusted "$file" "$root" || todo+=("$root")
+  done
+  ((${#todo[@]})) || return 0
+  command -v jq >/dev/null 2>&1 || { note "trust: jq is required"; return 1; }
+  tmp=$(mktemp "${file}.XXXXXX") || return 1
+  roots_json=$(jq -n --args '$ARGS.positional' "${todo[@]}") || { rm -f "$tmp"; return 1; }
+  if [[ -f $file ]]; then
+    jq --argjson roots "$roots_json" '
+      reduce $roots[] as $r (.;
+        .projects = (.projects // {}) |
+        .projects[$r] = ((.projects[$r] // {}) + {hasTrustDialogAccepted: true}))
+    ' "$file" >"$tmp" || { rm -f "$tmp"; note "trust: cannot update $file"; return 1; }
+  else
+    jq -n --argjson roots "$roots_json" '
+      {projects: (reduce $roots[] as $r ({}; .[$r] = {hasTrustDialogAccepted: true}))}
+    ' >"$tmp" || { rm -f "$tmp"; note "trust: cannot create $file"; return 1; }
+  fi
+  mode=$(file_mode "$file" 600)
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  TRUST_CHANGED=yes
+  if [[ $quiet != yes ]]; then
+    for root in "${todo[@]}"; do echo "trusted $root (claude)"; done
+  fi
+}
+
+# toml_key PATH: escape a path for a quoted TOML key.
+toml_key() {
+  local path=$1
+  path=${path//\\/\\\\}
+  path=${path//\"/\\\"}
+  printf '%s' "$path"
+}
+
+# codex_trusted FILE ROOT: whether Codex records ROOT as a trusted project.
+codex_trusted() {
+  local file=$1 root=$2 header
+  [[ -f $file ]] || return 1
+  header=$(printf '[projects."%s"]' "$(toml_key "$root")")
+  awk -v header="$header" '
+    $0 == header { in_section = 1; next }
+    in_section && /^\[/ { exit }
+    in_section && /^[[:space:]]*trust_level[[:space:]]*=[[:space:]]*"trusted"/ { found = 1; exit }
+    END { exit !found }
+  ' "$file"
+}
+
+# trust_codex_store QUIET ROOT...: mark each ROOT trusted in Codex's projects table.
+trust_codex_store() {
+  local quiet=$1; shift
+  local file tmp root header mode
+  local -a todo=()
+  file=$(codex_config)
+  for root in "$@"; do
+    codex_trusted "$file" "$root" || todo+=("$root")
+  done
+  ((${#todo[@]})) || return 0
+  mkdir -p "$(dirname "$file")" || return 1
+  if [[ ! -f $file ]]; then
+    : >"$file" || return 1
+    chmod 600 "$file"
+  fi
+  for root in "${todo[@]}"; do
+    header=$(printf '[projects."%s"]' "$(toml_key "$root")")
+    tmp=$(mktemp "${file}.XXXXXX") || return 1
+    awk -v header="$header" '
+      BEGIN { in_section = 0; done = 0; found_section = 0 }
+      $0 == header { in_section = 1; found_section = 1; print; next }
+      in_section && /^\[/ {
+        if (!done) { print "trust_level = \"trusted\""; done = 1 }
+        in_section = 0
+      }
+      in_section && /^[[:space:]]*trust_level[[:space:]]*=/ {
+        if (!done) { print "trust_level = \"trusted\""; done = 1 }
+        next
+      }
+      { print }
+      END {
+        if (in_section && !done) print "trust_level = \"trusted\""
+        if (!found_section) { print ""; print header; print "trust_level = \"trusted\"" }
+      }
+    ' "$file" >"$tmp" || { rm -f "$tmp"; return 1; }
+    mode=$(file_mode "$file" 600)
+    chmod "$mode" "$tmp" 2>/dev/null || chmod 600 "$tmp"
+    mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  done
+  TRUST_CHANGED=yes
+  if [[ $quiet != yes ]]; then
+    for root in "${todo[@]}"; do echo "trusted $root (codex)"; done
+  fi
+}
+
+# pi_trusted FILE ROOT: whether Pi records ROOT as trusted.
+pi_trusted() {
+  local file=$1 root=$2
+  [[ -f $file ]] || return 1
+  jq -e --arg root "$root" '.[$root] == true' "$file" >/dev/null 2>&1
+}
+
+# trust_pi_store QUIET ROOT...: mark each ROOT trusted in Pi's trust store.
+trust_pi_store() {
+  local quiet=$1; shift
+  local file tmp roots_json root mode
+  local -a todo=()
+  file=$(pi_config)
+  for root in "$@"; do
+    pi_trusted "$file" "$root" || todo+=("$root")
+  done
+  ((${#todo[@]})) || return 0
+  command -v jq >/dev/null 2>&1 || { note "trust: jq is required"; return 1; }
+  mkdir -p "$(dirname "$file")" || return 1
+  [[ -f $file ]] || printf '{}\n' >"$file"
+  tmp=$(mktemp "${file}.XXXXXX") || return 1
+  roots_json=$(jq -n --args '$ARGS.positional' "${todo[@]}") || { rm -f "$tmp"; return 1; }
+  jq --argjson roots "$roots_json" '
+    reduce $roots[] as $r (. ; .[$r] = true)
+  ' "$file" >"$tmp" || { rm -f "$tmp"; note "trust: cannot update $file"; return 1; }
+  mode=$(file_mode "$file" 644)
+  chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+  TRUST_CHANGED=yes
+  if [[ $quiet != yes ]]; then
+    for root in "${todo[@]}"; do echo "trusted $root (pi)"; done
+  fi
+}
+
+# trust_agent AGENT ROOT: pre-trust ROOT for every trust-gated agent before a launch, so the
+# selected one does not prompt and a later launch by another does not either. Codex and Pi then
+# cover their repository's worktrees; OpenCode has no workspace trust store, so it needs nothing.
+trust_agent() {
+  local agent=$1 root=$2
+  [[ -n $root ]] || return 0
+  trust_claude_store yes "$root" || true
+  trust_codex_store yes "$root" || true
+  trust_pi_store yes "$root" || true
+  return 0
+}
+
+# trust_main [--all] [--quiet] [DIR...]: record workspace trust for each DIR's repository root,
+# or for ~/dev and every repository under it with --all, in Claude, Codex and Pi. A parent
+# folder's trust does not cover nested repositories for Claude or Codex; Pi walks up to a parent.
+trust_main() {
+  local all=no quiet=no base='' root_given=no dir root found
+  local -a seen=() roots=()
+  while (($#)); do
+    case $1 in
+      --all) all=yes; shift ;;
+      --quiet) quiet=yes; shift ;;
+      --root)
+        shift
+        [[ -n ${1:-} ]] || { note "trust: --root needs a directory"; return 2; }
+        base=$1
+        root_given=yes
+        shift
+        ;;
+      -h | --help)
+        echo 'usage: worktree trust [--all] [--quiet] [--root DIR] [DIR...]'
+        return 0
+        ;;
+      --*) note "trust: unknown argument $1"; return 2 ;;
+      *) break ;;
+    esac
+  done
+  base=$(expand_path "${base:-$(managed_root)}")
+  if [[ -d $base ]]; then base=$(cd "$base" && pwd -P) || return 1; fi
+  [[ $root_given == yes ]] && all=yes
+  if [[ $all == yes ]]; then
+    roots+=("$base")
+    while IFS= read -r -d '' root; do
+      dir=${root%/.git}
+      [[ -d $dir ]] || continue
+      root=$(main_checkout "$dir" 2>/dev/null) || root=
+      [[ -n $root ]] && roots+=("$root")
+    done < <(find "$base" -maxdepth 4 -name .git \( -type d -o -type f \) -print0 2>/dev/null)
+  fi
+  for dir in "$@"; do
+    [[ -d $dir ]] || { note "trust: no directory $dir"; return 1; }
+    root=$(main_checkout "$dir" 2>/dev/null) || root=
+    if [[ -z $root ]]; then
+      root=$(cd "$dir" && pwd -P) || return 1
+    fi
+    roots+=("$root")
+  done
+  if ((${#roots[@]} == 0)); then
+    root=$(main_checkout "$PWD" 2>/dev/null) || root=
+    if [[ -z $root ]]; then
+      root=$(cd "$PWD" && pwd -P) || return 1
+    fi
+    roots+=("$root")
+  fi
+  for root in "${roots[@]}"; do
+    found=no
+    for dir in ${seen[@]+"${seen[@]}"}; do
+      if [[ $dir == "$root" ]]; then found=yes; break; fi
+    done
+    [[ $found == yes ]] && continue
+    seen+=("$root")
+  done
+  TRUST_CHANGED=no
+  trust_claude_store "$quiet" "${seen[@]}" || return 1
+  trust_codex_store "$quiet" "${seen[@]}" || return 1
+  trust_pi_store "$quiet" "${seen[@]}" || return 1
+  if [[ $TRUST_CHANGED == no && $quiet != yes ]]; then
+    echo "all trusted"
+  fi
+}
+
+# Command forms that do not launch an agent.
+case ${1:-} in
+  generator)
+    generator
+    exit 0
+    ;;
+  sync)
+    shift
+    sync_main "$@"
+    exit $?
+    ;;
+  clean)
+    shift
+    clean_main "$@"
+    exit $?
+    ;;
+  trust)
+    shift
+    trust_main "$@"
+    exit $?
+    ;;
+  -h | --help)
+    sed -n '2,/^# A script, not a shell function/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+esac
+
+prepare=false
+if [[ ${1:-} == --prepare ]]; then prepare=true; shift; fi
+[[ $# -gt 0 ]] || { echo "usage: worktree PROGRAM [-w [name]] [--base REF] [--no-fetch] [args...]" >&2; exit 2; }
+agent=$1
+shift
+if [[ $agent != */* && $agent != . && $agent != .. && -n $agent ]] &&
+  [[ $agent != sync && $agent != clean && $agent != trust ]]; then :; else
+  echo "worktree: invalid program name" >&2
+  exit 1
+fi
+
+# Find the helper's options before --, leaving all other arguments in their original order.
+args=()
+worktree=false
+name=
+base=
+fetch=yes
+here=false
+while (($#)); do
+  case $1 in
+    --) args+=("$@"); break ;;
+    -w)
+      $worktree && { echo "$agent: -w can only be specified once" >&2; exit 1; }
+      worktree=true
+      shift
+      if [[ -n ${1:-} && $1 != -* ]]; then name=$1; shift; fi
+      ;;
+    --base)
+      shift
+      [[ -n ${1:-} ]] || { echo "$agent: --base needs a ref" >&2; exit 1; }
+      base=$1
+      shift
+      ;;
+    --no-fetch) fetch=no; shift ;;
+    --fetch) fetch=yes; shift ;;
+    --here) here=true; shift ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+
+if ! $worktree; then
+  cwd=$PWD
+  info=no
+  for arg in ${args[@]+"${args[@]}"}; do
+    case $arg in
+      --help | -h | --version | -V) info=yes ;;
+    esac
+  done
+  if top=$(main_checkout "$cwd" 2>/dev/null) && [[ -n $top ]]; then
+    cwd_top=$(git -C "$cwd" rev-parse --path-format=absolute --show-toplevel 2>/dev/null) || cwd_top=
+    primary=$(primary_branch "$top") || primary=
+    branch=$(git -C "$top" branch --show-current 2>/dev/null) || branch=
+    if [[ $info == no ]] && [[ -n $cwd_top && $cwd_top == "$top" ]]; then
+      if ! $here; then
+        note "$agent: $top is the main checkout; start work with '$agent -w NAME'."
+        note "pass --here to launch an agent here anyway"
+        exit 1
+      fi
+      if [[ -n $primary && $branch != "$primary" ]]; then
+        note "$agent: launching in the main checkout on '${branch:-detached HEAD}'; expected '$primary'"
+      fi
+    fi
+  fi
+  if [[ -n ${top:-} ]]; then trust_agent "$agent" "$top" || true; fi
+  if $prepare; then
+    printf '%s\0' "$(pwd -P)"
+    if ((${#args[@]})); then printf '%s\0' "${args[@]}"; fi
+    exit 0
+  fi
+  lock_owned=no
+  wt=
+  if [[ -n ${top:-} ]]; then
+    wt=$(git -C "$cwd" rev-parse --path-format=absolute --show-toplevel 2>/dev/null) || wt=
+    if [[ -n $wt && $wt != "$top" ]] && worktree_locked "$top" "$wt"; then
+      note "$agent: $wt is already locked by another session"
+      exit 1
+    fi
+    if [[ -n $wt && $wt != "$top" ]] && git -C "$top" worktree lock "$wt" 2>/dev/null; then
+      lock_owned=yes
+    fi
+  fi
+  code=0
+  "$agent" "${args[@]+"${args[@]}"}" || code=$?
+  if [[ $lock_owned == yes ]]; then
+    git -C "$top" worktree unlock "$wt" >/dev/null 2>&1 || true
+  fi
+  exit $code
+fi
+
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) ||
+  { echo "$agent -w: run this inside a git repository" >&2; exit 1; }
+top=$(main_checkout "$PWD") || { echo "$agent -w: cannot find the main checkout" >&2; exit 1; }
+[[ $(git -C "$top" rev-parse --is-bare-repository 2>/dev/null) == false ]] ||
+  { echo "$agent -w: a non-bare main checkout is required" >&2; exit 1; }
+remote=$(primary_remote "$top") || remote=
+if [[ $fetch == yes && -n $remote ]]; then
+  fetch_primary "$top" "$remote" ||
+    note "$agent: could not fetch $remote; using cached refs"
+fi
+primary=$(primary_branch "$top") || primary=
+current=$(git -C "$top" branch --show-current 2>/dev/null) || current=
+if [[ -z $base && -n $primary && $current != "$primary" ]]; then
+  echo "$agent -w: the main checkout $top is on '${current:-detached HEAD}', not '$primary'." >&2
+  echo "Run 'worktree sync' to put it back, or pass --base REF to start from an explicit ref." >&2
+  exit 1
+fi
+if [[ -z $base ]]; then
+  [[ -n $primary ]] || { echo "$agent -w: no primary branch to start from" >&2; exit 1; }
+  commit=$(base_commit "$top" "$remote" "$primary") ||
+    { echo "$agent -w: cannot resolve $remote/$primary" >&2; exit 1; }
+elif [[ $base == HEAD ]]; then
+  # Stack on the checkout that invoked us, not the main checkout's primary branch.
+  commit=$(git rev-parse --verify 'HEAD^{commit}' 2>/dev/null) ||
+    { echo "$agent -w: cannot resolve --base HEAD" >&2; exit 1; }
+else
+  commit=$(git -C "$top" rev-parse --verify "$base^{commit}" 2>/dev/null) ||
+    { echo "$agent -w: cannot resolve --base $base" >&2; exit 1; }
+fi
+
+# Keep the reference checkout current when it is already where it belongs.
+if [[ -z $base && -n $remote && $current == "$primary" ]]; then
+  if [[ -z $(git -C "$top" status --porcelain 2>/dev/null) ]]; then
+    if ! git -C "$top" merge -q --ff-only "$remote/$primary" 2>/dev/null; then
+      note "$agent: $top's $primary has local commits not in $remote/$primary; starting from $remote/$primary"
+    fi
+  fi
+fi
+
+if [[ -z $name ]]; then
+  # A made-up name must start a new worktree, never resume an old one.
+  name=$(generator)
+  while [[ -e $top/.$agent/worktrees/$name ]] ||
+    git -C "$top" show-ref -q --verify "refs/heads/$agent/$name"; do name=$(generator); done
+fi
+branch=$agent/$name
+dir=$top/.$agent/worktrees/$name
+git check-ref-format --branch "$branch" >/dev/null 2>&1 ||
+  { echo "$agent -w: invalid worktree name: $name" >&2; exit 1; }
+if [[ -L $dir ]] || { [[ -e $dir ]] && [[ ! -d $dir ]]; }; then
+  echo "$agent -w: worktree path already exists and is not a directory: $dir" >&2
+  exit 1
+fi
+if worktree_locked "$top" "$dir"; then
+  echo "$agent -w: $dir is already locked by another session" >&2
+  echo "Unlock it with 'git -C \"$top\" worktree unlock \"$dir\"' if it is stale." >&2
+  exit 1
+fi
+if [[ -d $dir ]]; then
+  actual=$(git -C "$dir" rev-parse --path-format=absolute --show-toplevel 2>/dev/null) || actual=
+  actual_common=$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || actual_common=
+  actual_branch=$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null) || actual_branch=
+  if [[ $actual != "$dir" || $actual_common != "$common" || -z $actual_branch ]]; then
+    echo "$agent -w: existing directory is not the expected worktree on a branch: $dir" >&2
+    exit 1
+  fi
+  if [[ $actual_branch != "$branch" ]]; then
+    if git show-ref -q --verify "refs/heads/$branch"; then
+      echo "$agent -w: existing worktree is on $actual_branch, not $branch: $dir" >&2
+      exit 1
+    fi
+    echo "$agent -w: reusing worktree on renamed branch $actual_branch" >&2
+  fi
+else
+  if git show-ref -q --verify "refs/heads/$branch"; then
+    git worktree add -q "$dir" "$branch"
+  else
+    if [[ -n $(git status --porcelain --untracked-files=normal) ]]; then
+      echo "$agent -w: uncommitted changes stay in the current checkout" >&2
+    fi
+    git worktree add -q -b "$branch" "$dir" "$commit"
+  fi
+fi
+echo "$agent: $dir" >&2
+cd "$dir"
+trust_agent "$agent" "$top" || true
+if $prepare; then
+  printf '%s\0' "$(pwd -P)"
+  if ((${#args[@]})); then printf '%s\0' "${args[@]}"; fi
+  exit 0
+fi
+lock_owned=no
+if git -C "$top" worktree lock "$dir" 2>/dev/null; then lock_owned=yes; fi
+code=0
+"$agent" "${args[@]+"${args[@]}"}" || code=$?
+if [[ $lock_owned == yes ]]; then
+  git -C "$top" worktree unlock "$dir" >/dev/null 2>&1 || true
+fi
+exit $code

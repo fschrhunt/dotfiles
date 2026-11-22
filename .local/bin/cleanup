@@ -1,0 +1,91 @@
+#!/usr/bin/env bash
+# Daily cleanup of this machine, run by cleanup.timer on fat and the cleanup launch agent on
+# the Macs: stale temp files, agent session logs older than 30 days, and package caches
+# (only for the toolchains this machine has). On fat /tmp is RAM; systemd-tmpfiles also clears
+# anything there untouched for 3 days, and this clears the big offenders sooner.
+#
+#   cleanup             clean everything below
+#
+# Exits 1 when a step failed.
+set -uo pipefail
+# Same PATH as a login shell: fat's shared path.sh, or Homebrew and ~/.local/bin on a Mac.
+if [ -r "$HOME/.config/shell/path.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$HOME/.config/shell/path.sh"
+else
+  export PATH="$HOME/.local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/opt/homebrew/opt/rustup/bin:$PATH"
+fi
+# Tailscale's system daemon runs from Homebrew and owns its keg's bin folder as root, so brew
+# can't delete old Tailscale kegs without sudo; leave them out rather than fail every run.
+export HOMEBREW_NO_CLEANUP_FORMULAE=tailscale
+
+failed=()
+
+# step NAME COMMAND...: run one step, noting it when it fails.
+step() {
+  local name=$1
+  shift
+  echo "== $name"
+  "$@" || { echo "!! $name failed"; failed+=("$name"); }
+}
+
+# remove_stale MINUTES PATH...: delete each path nothing inside has touched for MINUTES. Go's
+# module caches are read-only, so write access comes back first.
+remove_stale() {
+  local minutes=$1 path
+  shift
+  for path in "$@"; do
+    [ -e "$path" ] || continue
+    [ -z "$(find "$path" -mmin "-$minutes" -print -quit 2>/dev/null)" ] || continue
+    echo "removing $path"
+    chmod -R u+w "$path" 2>/dev/null
+    rm -rf "$path"
+  done
+}
+
+# Temp files that outgrow /tmp's 3-day rule: Go caches agents point at /tmp, agent sessions' temp
+# folders, and the temp folder ask's agent runs use.
+temp() {
+  shopt -s nullglob
+  remove_stale 1440 /tmp/*gocache* /tmp/*go-cache*
+  remove_stale 2880 /tmp/claude-"$(id -u)"/*/*/
+  remove_stale 4320 "$HOME"/.cache/ask-agents-tmp/*
+}
+
+# Codex and Pi keep every session log forever; drop the ones older than 30 days. Claude Code prunes
+# its own (cleanupPeriodDays, default 30).
+sessions() {
+  local dir
+  for dir in "$HOME/.codex/sessions" "$HOME/.codex/archived_sessions" "$HOME/.pi/agent/sessions"; do
+    [ -d "$dir" ] || continue
+    find "$dir" -type f -mtime +30 -delete
+    find "$dir" -mindepth 1 -type d -empty -delete
+  done
+}
+
+# npm's cache only grows; start it over past 2 GB.
+npm_cache() {
+  npm cache verify >/dev/null
+  if [ "$(du -sm "$HOME/.npm" | cut -f1)" -gt 2048 ]; then npm cache clean --force; fi
+}
+
+# Go's build cache only grows; start it over past 2 GB.
+go_cache() {
+  local dir
+  dir=$(go env GOCACHE) || return
+  [ -d "$dir" ] || return 0
+  if [ "$(du -sm "$dir" | cut -f1)" -gt 2048 ]; then go clean -cache; fi
+}
+
+has() { command -v "$1" >/dev/null; }
+
+step temp temp
+step sessions sessions
+step brew brew cleanup --prune=all -s
+has uv && step uv uv cache prune
+has npm && step npm npm_cache
+has go && step go go_cache
+has pnpm && step pnpm pnpm store prune
+
+echo "cleanup finished $(date -u +%FT%TZ)${failed[*]:+; failed: ${failed[*]}}"
+[ ${#failed[@]} -eq 0 ]

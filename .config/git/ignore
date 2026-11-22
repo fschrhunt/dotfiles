@@ -1,0 +1,8 @@
+**/.claude/settings.local.json
+
+# Agent worktrees inside repos: ~/.local/bin/worktree, ask and Claude Code put them here.
+.codex/worktrees/
+.pi/worktrees/
+.opencode/worktrees/
+.ask/worktrees/
+.claude/worktrees/
