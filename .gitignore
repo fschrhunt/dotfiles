@@ -4,5 +4,6 @@
 
 # OpenCode merges opencode.json over the tracked opencode.jsonc; keep machine-only settings there.
 .config/opencode/opencode.json
-# OpenCode server password.
+# OpenCode server password (service.json and server.env).
 .config/opencode/service.json
+.config/opencode/server.env
