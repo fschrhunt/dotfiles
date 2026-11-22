@@ -39,7 +39,7 @@ autoload -Uz promptinit && promptinit
 prompt pure 2>/dev/null || PROMPT=$'❯ '
 
 # codex, opencode and pi -w [name]: start in a worktree; see ~/.local/bin/worktree.
-# Claude's -w uses .claude/worktrees and branch claude/<name> (its WorktreeCreate hook).
+# Claude's own -w works in .claude/worktrees/<name> on branch worktree-<name>.
 codex() { worktree codex "$@"; }
 pi() { worktree pi "$@"; }
 # OpenCode reads its instructions from ~/.config/opencode/AGENTS.md; don't also load ~/.claude/CLAUDE.md,

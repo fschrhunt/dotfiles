@@ -13,8 +13,8 @@ const leadingCd = /^\s*cd\s+([^\s;&|]+)\s*(&&|;)/;
 
 /**
  * The reason to block `command` run in `cwd`, or undefined to let it through. Agent branch
- * names (codex/*, pi/* and opencode/* from ~/.local/bin/worktree, ask/*, claude/* from Claude
- * Code's WorktreeCreate hook, and older worktree-* branches) are local placeholders, so a
+ * names (codex/*, pi/* and opencode/* from ~/.local/bin/worktree, ask/*, worktree-* from Claude
+ * Code's own -w, and older claude/* branches) are local placeholders, so a
  * `git push` from one is blocked. The push's directory is `git -C DIR`, else a leading `cd DIR &&`,
  * else `cwd`. Any failure lets the command through. The same check lives in OpenCode's and Pi's
  * worktree plugins and in ~/.agents/hooks/worktree (Claude Code and Codex); keep the prefixes in sync.

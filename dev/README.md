@@ -26,9 +26,8 @@ already has, and a failed fetch says so and falls back to them. Leave out the na
 made-up one like `bright-running-fox`. Run it again to
 come back to it. To stack a worktree on the current branch instead of main, pass `--base HEAD`.
 
-Claude's built-in `-w` uses the same convention through its `WorktreeCreate` hook:
-`.claude/worktrees/<name>` on branch `claude/<name>`. Reopening an older `worktree-<name>`
-worktree renames that branch to `claude/<name>`.
+Claude's own `-w` works the same way with its own names: `.claude/worktrees/<name>` on branch
+`worktree-<name>`.
 
 Rename the branch to say what it does before the first push.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # worktree: a PreToolUse hook for Bash, shared by Claude Code and Codex (both link here).
-# Agent branch names (codex/*, pi/* and opencode/* from ~/.local/bin/worktree, ask/*, claude/*
-# from Claude Code's WorktreeCreate hook, and older worktree-* branches) are local placeholders,
+# Agent branch names (codex/*, pi/* and opencode/* from ~/.local/bin/worktree, ask/*, worktree-*
+# from Claude Code's own -w, and older claude/* branches) are local placeholders,
 # so this blocks a `git push` from one: exit 2 with the reason on stderr. The push's directory is
 # `git -C DIR`, else a leading `cd DIR &&`, else the hook's cwd. Anything else, or any failure,
 # exits 0 and lets the call through. OpenCode (~/.config/opencode/plugins/worktree) and Pi
