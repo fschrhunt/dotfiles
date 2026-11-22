@@ -59,6 +59,9 @@
 !/.config/opencode/
 /.config/opencode/*
 !/.config/opencode/AGENTS.md
+!/.config/opencode/agents/
+/.config/opencode/agents/*
+!/.config/opencode/agents/build.md
 !/.config/opencode/cli.json
 !/.config/opencode/opencode.jsonc
 !/.config/opencode/plugins/
