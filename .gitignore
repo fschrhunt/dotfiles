@@ -1,0 +1,8 @@
+# Home-repo ignores: per-machine files that live inside tracked directories.
+# Untracked files are already hidden (status.showUntrackedFiles=no); this keeps a
+# `git add <dir>` from sweeping them in.
+
+# OpenCode merges opencode.json over the tracked opencode.jsonc; keep machine-only settings there.
+.config/opencode/opencode.json
+# OpenCode server password.
+.config/opencode/service.json
