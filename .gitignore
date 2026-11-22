@@ -1,9 +1,94 @@
-# Home-repo ignores: per-machine files that live inside tracked directories.
-# Untracked files are already hidden (status.showUntrackedFiles=no); this keeps a
-# `git add <dir>` from sweeping them in.
+# Allowlist: this repo is the home directory, so everything is ignored unless named here.
+# To track a new file, add a `!/path` line (and its parent directories' lines) below,
+# then `git add` it. Never `git add -f` around this file.
+#
+# Per-machine files stay out on purpose, for example ~/.claude/settings.json,
+# ~/.codex/config.toml, ~/.config/opencode/opencode.json (machine-only settings such as
+# code mode) and ~/.config/opencode/service.json / server.env (server password).
 
-# OpenCode merges opencode.json over the tracked opencode.jsonc; keep machine-only settings there.
-.config/opencode/opencode.json
-# OpenCode server password (service.json and server.env).
-.config/opencode/service.json
-.config/opencode/server.env
+/*
+!/.github/
+!/.agents/
+/.agents/*
+!/.agents/AGENTS.md
+!/.agents/hooks/
+/.agents/hooks/*
+!/.agents/hooks/worktree
+!/.agents/skills/
+/.agents/skills/*
+!/.agents/skills/ask/
+/.agents/skills/ask/*
+!/.agents/skills/ask/SKILL.md
+!/.ask/
+/.ask/*
+!/.ask/hooks/
+/.ask/hooks/*
+!/.ask/hooks/name
+!/.ask/settings.json
+!/.claude/
+/.claude/*
+!/.claude/CLAUDE.md
+!/.claude/hooks/
+/.claude/hooks/*
+!/.claude/hooks/worktree
+!/.claude/output-styles/
+/.claude/output-styles/*
+!/.claude/output-styles/agent.md
+!/.claude/skills/
+/.claude/skills/*
+!/.claude/skills/ask
+!/.codex/
+/.codex/*
+!/.codex/AGENTS.md
+!/.codex/hooks/
+/.codex/hooks/*
+!/.codex/hooks/worktree
+!/.config/
+/.config/*
+!/.config/fish/
+/.config/fish/*
+!/.config/fish/config.fish
+!/.config/fish/fish_plugins
+!/.config/git/
+/.config/git/*
+!/.config/git/hooks/
+/.config/git/hooks/*
+!/.config/git/hooks/pre-commit
+!/.config/git/ignore
+!/.config/nvim
+!/.config/opencode/
+/.config/opencode/*
+!/.config/opencode/AGENTS.md
+!/.config/opencode/cli.json
+!/.config/opencode/opencode.jsonc
+!/.config/opencode/plugins/
+/.config/opencode/plugins/*
+!/.config/opencode/plugins/worktree/
+/.config/opencode/plugins/worktree/*
+!/.config/opencode/plugins/worktree/index.ts
+!/.config/zsh/
+/.config/zsh/*
+!/.config/zsh/aliases.zsh
+!/.gitconfig
+!/.gitignore
+!/.local/
+/.local/*
+!/.local/bin/
+/.local/bin/*
+!/.local/bin/worktree
+!/.pi/
+/.pi/*
+!/.pi/agent/
+/.pi/agent/*
+!/.pi/agent/AGENTS.md
+!/.pi/agent/extensions/
+/.pi/agent/extensions/*
+!/.pi/agent/extensions/worktree/
+/.pi/agent/extensions/worktree/*
+!/.pi/agent/extensions/worktree/index.ts
+!/.pi/agent/mcp.json
+!/.tmux.conf
+!/.zshrc
+!/dev/
+/dev/*
+!/dev/README.md
